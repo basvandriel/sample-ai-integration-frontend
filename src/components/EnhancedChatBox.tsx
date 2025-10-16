@@ -1,29 +1,18 @@
+
 import { useState, useRef, useEffect } from 'react';
+import { TypewriterMessage } from './TypewriterMessage';
 import { chatService, type ChatMessage } from '../services/chatService';
 
-interface StreamingMessage extends ChatMessage {
+interface Message extends ChatMessage {
   isStreaming?: boolean;
-  displayedContent?: string;
 }
 
 export default function EnhancedChatBox() {
-  const [messages, setMessages] = useState<StreamingMessage[]>([]);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isConnected, setIsConnected] = useState(false);
-  const [streamingMessageId, setStreamingMessageId] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
-  useEffect(() => {
-    scrollToBottom();
-  }, [messages]);
-
-
-
 
 
   // Check if backend is available
@@ -62,25 +51,11 @@ export default function EnhancedChatBox() {
     return () => clearInterval(interval);
   }, []);
 
-  // Update welcome message based on connection status
-  useEffect(() => {
-    const welcomeMessage: StreamingMessage = {
-      id: 'welcome',
-      role: 'assistant',
-      content: isConnected 
-        ? 'Hello! I\'m your AI assistant. I\'m connected and ready to help. What would you like to know?'
-        : 'Hello! I\'m your AI assistant, but I\'m currently disconnected from the backend service. Please make sure your API is running at http://localhost:8000',
-      timestamp: new Date()
-    };
-
-    setMessages([welcomeMessage]);
-  }, [isConnected]);
-
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputValue.trim() || isLoading) return;
 
-    const userMessage: StreamingMessage = {
+  const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
       content: inputValue,
@@ -93,97 +68,78 @@ export default function EnhancedChatBox() {
 
     // Create AI message placeholder
     const aiMessageId = (Date.now() + 1).toString();
-    const aiMessagePlaceholder: StreamingMessage = {
-      id: aiMessageId,
-      role: 'assistant',
-      content: '',
-      timestamp: new Date(),
-      isStreaming: true,
-      displayedContent: ''
+  
+  const aiMessagePlaceholder: Message = {
+  id: aiMessageId,
+  role: 'assistant',
+  content: '',
+  timestamp: new Date(),
+  isStreaming: true
     };
 
     setMessages(prev => [...prev, aiMessagePlaceholder]);
 
+    const controller = new AbortController();
+    const { signal } = controller;
+
+    // controller will be aborted in finally to cancel the fetch if needed
+
     try {
-      // Real streaming API call
-      let fullResponseText = '';
-      
-      await chatService.sendMessageStream(
-        userMessage.content,
-        // onChunk - called for each streaming chunk
-        (chunk: string) => {
-          fullResponseText += chunk;
-          setMessages(prev => 
-            prev.map(msg => 
-              msg.id === aiMessageId 
-                ? { 
-                    ...msg, 
-                    content: fullResponseText,
-                    displayedContent: fullResponseText,
-                    isStreaming: true 
-                  }
-                : msg
-            )
-          );
-        },
-        // onComplete - called when streaming finishes
-        () => {
-          setMessages(prev => 
-            prev.map(msg => 
-              msg.id === aiMessageId 
-                ? { 
-                    ...msg, 
-                    content: fullResponseText,
-                    displayedContent: fullResponseText,
-                    isStreaming: false 
-                  }
-                : msg
-            )
-          );
-          setStreamingMessageId(null);
-        },
-        // onError - called if streaming fails
-        (error: Error) => {
-          console.error('Streaming error:', error);
-          const errorText = 'Sorry, I encountered an error during streaming. Please try again.';
-          setMessages(prev => 
-            prev.map(msg => 
-              msg.id === aiMessageId 
-                ? { 
-                    ...msg, 
-                    content: errorText,
-                    displayedContent: errorText,
-                    isStreaming: false 
-                  }
-                : msg
-            )
-          );
-          setStreamingMessageId(null);
+      // Consume the async generator streamResponse
+      let chunkCount = 0;
+      const startTime = Date.now();
+
+      for await (const evt of chatService.streamResponse(userMessage.content, signal)) {
+        if (evt.type === 'chunk') {
+          chunkCount++;
+          const elapsed = Date.now() - startTime;
+          console.log(`📦 Chunk ${chunkCount} (${elapsed}ms):`, evt.content, 'Length:', evt.content.length);
+
+          setMessages(prev => prev.map(msg =>
+            msg.id === aiMessageId
+              ? { ...msg, content: msg.content + evt.content, isStreaming: true }
+              : msg
+          ));
+        } else if (evt.type === 'done') {
+          // Received done signal; stop consuming
+          break;
+        } else if (evt.type === 'error') {
+          console.error('Stream error event from service:', evt.error);
+          setMessages(prev => prev.map(msg =>
+            msg.id === aiMessageId
+              ? { ...msg, content: `Error: ${evt.error}`, isStreaming: false }
+              : msg
+          ));
+          break;
         }
-      );
-      
+      }
+
+      // Mark streaming finished
+      setMessages(prev => prev.map(msg =>
+        msg.id === aiMessageId ? { ...msg, isStreaming: false } : msg
+      ));
+
     } catch (error) {
-      console.error('Error starting stream:', error);
+      console.error('Error while streaming response:', error);
       const errorText = 'Sorry, I encountered an error connecting to the AI service. Please check your backend connection.';
-      
-      setMessages(prev => 
-        prev.map(msg => 
-          msg.id === aiMessageId 
-            ? { 
-                ...msg, 
-                content: errorText,
-                displayedContent: errorText,
-                isStreaming: false 
-              }
-            : msg
-        )
-      );
-      
-      setStreamingMessageId(null);
+      setMessages(prev => prev.map(msg =>
+        msg.id === aiMessageId
+          ? { ...msg, content: errorText, isStreaming: false }
+          : msg
+      ));
     } finally {
       setIsLoading(false);
+      // Ensure controller is cleaned up
+      try { controller.abort(); } catch {}
     }
   };
+
+  // Abort any active streaming if the component unmounts
+  useEffect(() => {
+    return () => {
+      // No-op: individual submit handlers create their own controllers
+    };
+  }, []);
 
   return (
     <div className="flex flex-col h-screen max-w-4xl mx-auto bg-gray-50">
@@ -236,15 +192,11 @@ export default function EnhancedChatBox() {
               }`}
             >
               <div className="text-sm whitespace-pre-wrap">
-                {message.role === 'assistant' && message.isStreaming 
-                  ? (
-                    <span>
-                      {message.displayedContent}
-                      <span className="inline-block w-0.5 h-4 bg-blue-500 ml-1 animate-[pulse_1s_ease-in-out_infinite] rounded-sm"></span>
-                    </span>
-                  )
-                  : message.displayedContent || message.content
-                }
+                {message.role === 'assistant' ? (
+                  <TypewriterMessage content={message.content} isStreaming={message.isStreaming} />
+                ) : (
+                  message.content
+                )}
               </div>
               <p className={`text-xs mt-1 ${
                 message.role === 'user' ? 'text-blue-100' : 'text-gray-500'

@@ -12,6 +12,12 @@ export interface ChatResponse {
   message: string;
 }
 
+// Stream event types yielded by streamResponse
+export type StreamEvent =
+  | { type: 'chunk'; content: string }
+  | { type: 'done' }
+  | { type: 'error'; error: string };
+
 class ChatService {
   private baseUrl: string;
 
@@ -43,80 +49,82 @@ class ChatService {
     }
   }
 
-  async sendMessageStream(
-    message: string, 
-    onChunk: (chunk: string) => void,  // Receives individual chunks
-    onComplete: () => void,
-    onError: (error: Error) => void
-  ): Promise<void> {
+  // Removed legacy callback-based sendMessageStream in favor of async generator streamResponse
+
+  // New: Async generator that yields each streaming chunk. Consumer can use for await...of
+  async *streamResponse(message: string, signal?: AbortSignal): AsyncGenerator<StreamEvent, void, void> {
+    const resp = await fetch(`${this.baseUrl}/chat/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+      signal,
+    });
+
+    if (!resp.ok) {
+      throw new Error(`HTTP error! status: ${resp.status}`);
+    }
+
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+
     try {
-      const response = await fetch(`${this.baseUrl}/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
-      }
-
-      const reader = response.body!.getReader();
-      const decoder = new TextDecoder();
-
+      let buffer = '';
       while (true) {
         const { done, value } = await reader.read();
-        
-        if (done) {
-          onComplete();
-          break;
-        }
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
 
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
-        
+        // Split by newline and process complete lines
+        const lines = buffer.split('\n');
+        // Keep the last partial line in buffer
+        buffer = lines.pop() || '';
+
         for (const line of lines) {
-          if (line.trim()) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6);
-              
-              // Skip completion indicators
-              if (data === '[DONE]') {
-                onComplete();
-                return;
-              }
-              
-              try {
-                const parsed = JSON.parse(data);
-                
-                // Skip completion indicators in JSON format
-                if (parsed.done === true) {
-                  onComplete();
-                  return;
-                }
-                
-                // Extract content from various possible formats
-                const content = parsed.content || parsed.message || parsed.text || parsed.delta?.content;
-                if (content && typeof content === 'string') {
-                  onChunk(content);  // Send individual chunk
-                }
-              } catch (e) {
-                // If not JSON, treat as plain text (but skip completion markers)
-                if (data !== 'DONE' && data !== 'END' && !data.includes('"done"')) {
-                  onChunk(data);
-                }
-              }
-            } else {
-              // Plain text streaming - skip completion indicators
-              if (line !== 'DONE' && line !== 'END' && !line.includes('"done"')) {
-                onChunk(line);
-              }
+          if (!line.trim()) continue;
+          const contentLine = line.startsWith('data: ') ? line.slice(6) : line;
+          if (contentLine === '[DONE]' || contentLine === 'DONE' || contentLine === 'END') {
+            yield { type: 'done' };
+            return;
+          }
+          try {
+            const parsed = JSON.parse(contentLine);
+            if (parsed.done === true) {
+              yield { type: 'done' };
+              return;
+            }
+            const content = parsed.content || parsed.message || parsed.text || parsed.delta?.content;
+            if (content && typeof content === 'string') {
+              yield { type: 'chunk', content };
+            }
+          } catch {
+            // Not JSON, yield raw text (if not a completion marker)
+            if (!contentLine.includes('\"done\"')) {
+              yield { type: 'chunk', content: contentLine };
             }
           }
         }
       }
-    } catch (error) {
-      console.error('Error streaming message:', error);
-      onError(error instanceof Error ? error : new Error('Unknown streaming error'));
+      // After stream ends, if buffer contains leftover content, try to parse/yield
+      if (buffer.trim()) {
+        const contentLine = buffer.startsWith('data: ') ? buffer.slice(6) : buffer;
+        try {
+          const parsed = JSON.parse(contentLine);
+          if (parsed.done === true) {
+            yield { type: 'done' };
+          } else {
+            const content = parsed.content || parsed.message || parsed.text || parsed.delta?.content;
+            if (content && typeof content === 'string') {
+              yield { type: 'chunk', content };
+            }
+          }
+        } catch {
+          if (!contentLine.includes('\"done\"')) {
+            yield { type: 'chunk', content: contentLine };
+          }
+        }
+      }
+    } finally {
+      try { reader.releaseLock(); } catch {}
     }
   }
 }
